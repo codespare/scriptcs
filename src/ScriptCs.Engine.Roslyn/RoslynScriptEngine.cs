@@ -1,12 +1,19 @@
 ﻿using System;
 using System.Collections.Generic;
+using System.Diagnostics;
+using System.IO;
 using System.Linq;
+using System.Reflection;
+using System.Runtime.InteropServices;
 using Common.Logging;
-using Roslyn.Compilers;
-using Roslyn.Compilers.CSharp;
-using Roslyn.Scripting;
-using Roslyn.Scripting.CSharp;
-
+using Microsoft.CodeAnalysis;
+using Microsoft.CodeAnalysis.CSharp;
+//using Roslyn.Compilers;
+//using Roslyn.Compilers.CSharp;
+//using Roslyn.Scripting;
+//using Roslyn.Scripting.CSharp;
+using Microsoft.CodeAnalysis.CSharp.Syntax;
+using Microsoft.CodeAnalysis.Emit;
 using ScriptCs.Contracts;
 using System.Text.RegularExpressions;
 
@@ -14,31 +21,49 @@ namespace ScriptCs.Engine.Roslyn
 {
     public class RoslynScriptEngine : IScriptEngine
     {
-        protected readonly ScriptEngine ScriptEngine;
         private readonly IScriptHostFactory _scriptHostFactory;
+        private IScriptHost _host;
+        private Type _hostType;
+        private CSharpCompilation _previousSubmission;
+        private List<MetadataReference> _submissionReferences;
+        private int _submissionCounter;
+        private List<object> _submissionArguments;
+        const string _submissionNamePrefix = "InteractiveSubmission";
+        const long _submissionCounterCycle = TimeSpan.TicksPerDay * 365;
 
         public const string SessionKey = "Session";
         private const string InvalidNamespaceError = "error CS0246";
 
         public RoslynScriptEngine(IScriptHostFactory scriptHostFactory, ILog logger)
         {
-            ScriptEngine = new ScriptEngine();
-            ScriptEngine.AddReference(typeof(ScriptExecutor).Assembly);
             _scriptHostFactory = scriptHostFactory;
             Logger = logger;
+            _host = null;
+            _hostType = null;
+            _previousSubmission = null;
+            _submissionReferences = new List<MetadataReference>();
+            _submissionCounter = 0;
+            _submissionArguments = new List<object>(32);
         }
 
         protected ILog Logger { get; private set; }
 
         public string BaseDirectory
         {
-            get { return ScriptEngine.BaseDirectory; }
-            set { ScriptEngine.BaseDirectory = value; }
+            get;
+            set;
         }
 
         public string CacheDirectory { get; set; }
 
         public string FileName { get; set; }
+
+        private string GetSubmissionName()
+        {
+            var counter = (DateTime.UtcNow.Ticks % _submissionCounterCycle) / 1000L;
+            string assemblyName = _submissionNamePrefix + counter.ToString("000-000-000-000");
+            return assemblyName;
+        }
 
         public ScriptResult Execute(string code, string[] scriptArgs, AssemblyReferences references, IEnumerable<string> namespaces, ScriptPackSession scriptPackSession)
         {
@@ -51,46 +76,34 @@ namespace ScriptCs.Engine.Roslyn
             var executionReferences = new AssemblyReferences(references.PathReferences, references.Assemblies);
             executionReferences.PathReferences.UnionWith(scriptPackSession.References);
 
-            SessionState<Session> sessionState;
+            SessionState<string[]> sessionState;
 
             var isFirstExecution = !scriptPackSession.State.ContainsKey(SessionKey);
+
+            Debug.Assert(_submissionCounter > 0 || isFirstExecution);
+            Debug.Assert(_submissionArguments.Count > 1 || isFirstExecution);
 
             if (isFirstExecution)
             {
                 code = code.DefineTrace();
-                var host = _scriptHostFactory.CreateScriptHost(new ScriptPackManager(scriptPackSession.Contexts), scriptArgs);
+                _host = _scriptHostFactory.CreateScriptHost(new ScriptPackManager(scriptPackSession.Contexts), scriptArgs);
                 Logger.Debug("Creating session");
 
-                var hostType = host.GetType();
-                ScriptEngine.AddReference(hostType.Assembly);
-                var session = ScriptEngine.CreateSession(host, hostType);
+                _hostType = _host.GetType();
+                _submissionArguments.Add(_host);
+
                 var allNamespaces = namespaces.Union(scriptPackSession.Namespaces).Distinct();
 
-                foreach (var reference in executionReferences.PathReferences)
-                {
-                    Logger.DebugFormat("Adding reference to {0}", reference);
-                    session.AddReference(reference);
-                }
+                executionReferences.Assemblies.Add(typeof(ScriptExecutor).Assembly);
+                executionReferences.Assemblies.Add(_hostType.Assembly);
 
-                foreach (var assembly in executionReferences.Assemblies)
-                {
-                    Logger.DebugFormat("Adding reference to {0}", assembly.FullName);
-                    session.AddReference(assembly);
-                }
-
-                foreach (var @namespace in allNamespaces)
-                {
-                    Logger.DebugFormat("Importing namespace {0}", @namespace);
-                    session.ImportNamespace(@namespace);
-                }
-
-                sessionState = new SessionState<Session> { References = executionReferences, Session = session, Namespaces = new HashSet<string>(allNamespaces) };
+                sessionState = new SessionState<string[]> { References = executionReferences, Session = scriptArgs, Namespaces = new HashSet<string>(allNamespaces) };
                 scriptPackSession.State[SessionKey] = sessionState;
             }
             else
             {
                 Logger.Debug("Reusing existing session");
-                sessionState = (SessionState<Session>)scriptPackSession.State[SessionKey];
+                sessionState = (SessionState<string[]>)scriptPackSession.State[SessionKey];
 
                 if (sessionState.References == null)
                 {
@@ -107,14 +120,12 @@ namespace ScriptCs.Engine.Roslyn
                 foreach (var reference in newReferences.PathReferences)
                 {
                     Logger.DebugFormat("Adding reference to {0}", reference);
-                    sessionState.Session.AddReference(reference);
                     sessionState.References.PathReferences.Add(reference);
                 }
 
                 foreach (var assembly in newReferences.Assemblies)
                 {
                     Logger.DebugFormat("Adding reference to {0}", assembly.FullName);
-                    sessionState.Session.AddReference(assembly);
                     sessionState.References.Assemblies.Add(assembly);
                 }
 
@@ -123,70 +134,172 @@ namespace ScriptCs.Engine.Roslyn
                 foreach (var @namespace in newNamespaces)
                 {
                     Logger.DebugFormat("Importing namespace {0}", @namespace);
-                    sessionState.Session.ImportNamespace(@namespace);
                     sessionState.Namespaces.Add(@namespace);
                 }
+
+                sessionState.Session = scriptArgs;
             }
 
             Logger.Debug("Starting execution");
 
-            var result = Execute(code, sessionState.Session);
+            var result = Execute(code, sessionState);
 
-            if (result.InvalidNamespaces.Any())
-            {
-                var pendingNamespacesField = sessionState.Session.GetType().GetField("pendingNamespaces", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic);
+            //if (result.InvalidNamespaces.Any())
+            //{
+            //    var pendingNamespacesField = sessionState.Session.GetType().GetField("pendingNamespaces", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic);
 
-                if (pendingNamespacesField != null)
-                {
-                    var pendingNamespacesValue = (ReadOnlyArray<string>)pendingNamespacesField.GetValue(sessionState.Session);
-                    //no need to check this for null as ReadOnlyArray is a value type
+            //    if (pendingNamespacesField != null)
+            //    {
+            //        var pendingNamespacesValue = (ReadOnlyArray<string>)pendingNamespacesField.GetValue(sessionState.Session);
+            //        //no need to check this for null as ReadOnlyArray is a value type
 
-                    if (pendingNamespacesValue.Any())
-                    {
-                        var fixedNamespaces = pendingNamespacesValue.ToList();
+            //        if (pendingNamespacesValue.Any())
+            //        {
+            //            var fixedNamespaces = pendingNamespacesValue.ToList();
 
-                        foreach (var @namespace in result.InvalidNamespaces)
-                        {
-                            sessionState.Namespaces.Remove(@namespace);
-                            fixedNamespaces.Remove(@namespace);
-                        }
-                        pendingNamespacesField.SetValue(sessionState.Session, ReadOnlyArray<string>.CreateFrom<string>(fixedNamespaces));
-                    }
-                }
-            }
+            //            foreach (var @namespace in result.InvalidNamespaces)
+            //            {
+            //                sessionState.Namespaces.Remove(@namespace);
+            //                fixedNamespaces.Remove(@namespace);
+            //            }
+            //            pendingNamespacesField.SetValue(sessionState.Session, ReadOnlyArray<string>.CreateFrom<string>(fixedNamespaces));
+            //        }
+            //    }
+            //}
 
             Logger.Debug("Finished execution");
             return result;
         }
 
-        protected virtual ScriptResult Execute(string code, Session session)
+        protected CSharpCompilation CompileSubmission(string code, SessionState<string[]> session)
+        {
+            var parseOptions = new CSharpParseOptions(LanguageVersion.CSharp6, DocumentationMode.None, SourceCodeKind.Interactive);
+            var syntaxTree = CSharpSyntaxTree.ParseText(code, parseOptions);
+            if (!SyntaxFactory.IsCompleteSubmission(syntaxTree)) {
+                return null;
+            }
+
+            var assemblyName = GetSubmissionName();
+            var references = GetMetadataReferences(session.References);
+            var compilationOptions = new CSharpCompilationOptions(
+                outputKind : OutputKind.DynamicallyLinkedLibrary,
+                usings : session.Namespaces,
+                optimizationLevel : OptimizationLevel.Debug,
+                checkOverflow : false,
+                allowUnsafe : true,
+                generalDiagnosticOption : ReportDiagnostic.Error,
+                warningLevel : 0,
+                specificDiagnosticOptions : new KeyValuePair<string, ReportDiagnostic>[] { },
+                concurrentBuild : false
+                );
+
+            var submission = CSharpCompilation.CreateSubmission(
+                assemblyName,
+                syntaxTree,
+                references,
+                compilationOptions,
+                previousSubmission : _previousSubmission,
+                //returnType : null,
+                hostObjectType : _hostType
+                );
+
+            return submission;
+        }
+
+        protected virtual ScriptResult Execute(string code, SessionState<string[]> session)
         {
             Guard.AgainstNullArgument("session", session);
 
-            if (string.IsNullOrWhiteSpace(FileName) && !IsCompleteSubmission(code))
-            {
-                return ScriptResult.Incomplete;
-            }
+            //if (string.IsNullOrWhiteSpace(FileName))
+            //{
+            //    return ScriptResult.Incomplete;
+            //}
 
             try
             {
-                var submission = session.CompileSubmission<object>(code);
+                var submission = CompileSubmission(code, session);
+                if (submission == null) {
+                    return ScriptResult.Incomplete;
+                }
 
                 try
                 {
-                    return new ScriptResult(returnValue: submission.Execute());
+                    using (MemoryStream peStream = new MemoryStream()) {
+                        var emitOptions = new EmitOptions(
+                            runtimeMetadataVersion : "v4.0.30319",
+                            tolerateErrors: true
+                            );
+                        Trace.WriteLine("Emitting submission " + submission.AssemblyName + " to memory.");
+                        var emitResult = submission.Emit(peStream, options: emitOptions);
+
+                        //Trace.WriteLine("Emitting submission " + submission.AssemblyName + " to disk.");
+                        //var emitResult = submission.Emit(submission.AssemblyName + ".dll", submission.AssemblyName + ".pdb", submission.AssemblyName + ".xml");
+
+                        if (emitResult.Success || emitResult.Diagnostics.Count(d => d.Severity == DiagnosticSeverity.Error) == 0) {
+                            var peBytes = peStream.ToArray();
+                            Trace.WriteLine("Loading emitted assembly " + submission.AssemblyName + " from memory.");
+                            var assembly = Assembly.Load(peBytes);
+                            //Trace.WriteLine("Loading emitted assembly " + submission.AssemblyName + " from disk.");
+                            //var assembly = Assembly.LoadFile(Path.Combine(Environment.CurrentDirectory, submission.AssemblyName + ".dll"));
+
+                            _previousSubmission = submission;
+                            //var submissionReference = MetadataReference.CreateFromImage(peBytes);
+                            //var submissionReference = MetadataReference.CreateFromFile(submission.AssemblyName + ".dll");
+                            var submissionReference = AssemblyMetadata.CreateFromImage(peBytes).GetReference( display : submission.MakeSourceAssemblySimpleName());
+                            _submissionReferences.Add(submissionReference);
+
+                            Trace.WriteLineIf(assembly != null, "Looking up Script class.");
+                            var script = assembly?.GetType("Script");
+                            Trace.WriteLineIf(script != null, "Looking up Script class <Factory> method.");
+                            var scriptMethod = script?.GetMethod("<Factory>");
+                            Trace.WriteLineIf(scriptMethod != null, "Building delegate for Script class <Factory> method.");
+                            var scriptCallback = scriptMethod?.CreateDelegate(typeof(ScriptCallback)) as ScriptCallback;
+
+                            object scriptResult = null;
+                            if (scriptCallback != null)
+	                        {
+                                var submissionArguments = new object[_submissionArguments.Count + 1];
+                                for (int i = 0; i < _submissionArguments.Count; i++)
+			                    {
+			                        submissionArguments[i] = _submissionArguments[i];
+			                    }
+
+                                Trace.WriteLineIf(scriptMethod != null, "Invoking delegate for Script class <Factory> method.");
+                                scriptResult = scriptCallback(submissionArguments);
+
+                                _submissionArguments.Add(submissionArguments[submissionArguments.Length - 1]);
+                                _submissionCounter++;
+	                        }
+
+                            return (scriptResult != null) ? new ScriptResult(returnValue : scriptResult) : ScriptResult.Empty;
+                        }
+                        else {
+                            var errors = emitResult
+                                .Diagnostics
+                                .Where(d => d.Severity == DiagnosticSeverity.Error)
+                                .Select(d => new ApplicationException(d.ToString()));
+                            foreach (var error in errors)
+	                        {
+		                        Trace.TraceError(error.ToString());
+	                        }
+                            throw new AggregateException(errors);
+                        }
+                    }
                 }
                 catch (AggregateException ex)
                 {
+                    Trace.TraceError(ex.ToString());
                     return new ScriptResult(executionException: ex.InnerException);
                 }
                 catch (Exception ex)
                 {
+                    Trace.TraceError(ex.ToString());
                     return new ScriptResult(executionException: ex);
                 }
             }
             catch (Exception ex)
             {
+                Trace.WriteLine(ex.ToString());
                 if (ex.Message.StartsWith(InvalidNamespaceError))
                 {
                     var offendingNamespace = Regex.Match(ex.Message, @"\'([^']*)\'").Groups[1].Value;
@@ -197,18 +310,31 @@ namespace ScriptCs.Engine.Roslyn
             }
         }
 
-        private static bool IsCompleteSubmission(string code)
+        delegate object ScriptCallback(object[] o);
+
+        private IEnumerable<MetadataReference> GetMetadataReferences(AssemblyReferences assemblyReferences)
         {
-            var options = new ParseOptions(
-                CompatibilityMode.None,
-                LanguageVersion.CSharp4,
-                true,
-                SourceCodeKind.Interactive,
-                default(ReadOnlyArray<string>));
+            var netFrameworkDirectoryPath = RuntimeEnvironment.GetRuntimeDirectory();
+            var gacPaths = assemblyReferences.PathReferences
+                .Concat(new[] { "mscorlib", "Microsoft.CSharp" })
+                .Select(p => Path.Combine(netFrameworkDirectoryPath, p.EndsWith(".dll") ? p : p + ".dll"))
+                .Where(p => File.Exists(p))
+                .Distinct();
 
-            var syntaxTree = SyntaxTree.ParseText(code, options: options);
+            var gacAssemblies = gacPaths.Select(p => Assembly.LoadFile(p));
 
-            return Syntax.IsCompleteSubmission(syntaxTree);
+            return assemblyReferences.Assemblies.Select(a => MetadataReference.CreateFromAssembly(a))
+                .Concat(gacAssemblies.Select(a => MetadataReference.CreateFromAssembly(a)))
+                .Concat(_submissionReferences);
+        }
+
+        private void AddReferencedCompilations(IEnumerable<Compilation> referencedCompilations, List<MetadataReference> references)
+        {
+            if (referencedCompilations != null) {
+                foreach (var referencedCompilation in referencedCompilations) {
+                    references.Add(referencedCompilation.EmitToImageReference());
+                }
+            }
         }
     }
 }

@@ -1,7 +1,7 @@
 ﻿
 Microsoft Visual Studio Solution File, Format Version 12.00
 # Visual Studio 2013
-VisualStudioVersion = 12.0.30501.0
+VisualStudioVersion = 12.0.30723.0
 MinimumVisualStudioVersion = 10.0.40219.1
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "ScriptCs", "src\ScriptCs\ScriptCs.csproj", "{25080671-1A80-4041-B9C7-260578FF4849}"
 EndProject
@@ -74,9 +74,7 @@ Global
 		{E79EC231-E27D-4057-91C9-2D001A3A8C3B}.Release|Any CPU.ActiveCfg = Release|Any CPU
 		{E79EC231-E27D-4057-91C9-2D001A3A8C3B}.Release|Any CPU.Build.0 = Release|Any CPU
 		{28D11DE5-9F98-4E0A-8CCC-9CDC19110451}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
-		{28D11DE5-9F98-4E0A-8CCC-9CDC19110451}.Debug|Any CPU.Build.0 = Debug|Any CPU
 		{28D11DE5-9F98-4E0A-8CCC-9CDC19110451}.Release|Any CPU.ActiveCfg = Release|Any CPU
-		{28D11DE5-9F98-4E0A-8CCC-9CDC19110451}.Release|Any CPU.Build.0 = Release|Any CPU
 		{9AEF2D95-87FB-4829-B384-34BFE076D531}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
 		{9AEF2D95-87FB-4829-B384-34BFE076D531}.Debug|Any CPU.Build.0 = Debug|Any CPU
 		{9AEF2D95-87FB-4829-B384-34BFE076D531}.Release|Any CPU.ActiveCfg = Release|Any CPU

@@ -56,7 +56,11 @@ namespace ScriptCs
                 _logger.DebugFormat("Resolving from: {0} to: {1}", args.Name, assemblyInfo.Assembly.GetName());
                 return assemblyInfo.Assembly;
             }
-            return null;
+            else {
+                var appDomain = sender as AppDomain;
+                var assembly = appDomain.GetAssemblies().FirstOrDefault(a => StringComparer.OrdinalIgnoreCase.Equals(args.Name, a.FullName));
+                return assembly;
+            }
         }
 
         public void Initialize()

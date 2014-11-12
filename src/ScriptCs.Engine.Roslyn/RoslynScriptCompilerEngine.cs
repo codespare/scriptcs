@@ -4,7 +4,7 @@ using System.Linq;
 using System.Reflection;
 using Common.Logging;
 
-using Roslyn.Scripting;
+//using Roslyn.Scripting;
 using ScriptCs.Contracts;
 using ScriptCs.Exceptions;
 
@@ -27,7 +27,7 @@ namespace ScriptCs.Engine.Roslyn
 
         protected abstract Assembly LoadAssemblyFromCache();
 
-        protected override ScriptResult Execute(string code, Session session)
+        protected override ScriptResult Execute(string code, SessionState<string[]> session)
         {
             Guard.AgainstNullArgument("session", session);
 
@@ -36,17 +36,18 @@ namespace ScriptCs.Engine.Roslyn
                 : InvokeEntryPointMethod(session, LoadAssemblyFromCache());
         }
 
-        private ScriptResult CompileAndExecute(string code, Session session)
+        private ScriptResult CompileAndExecute(string code, SessionState<string[]> session)
         {
             Logger.Debug("Compiling submission");
             try
             {
-                var submission = session.CompileSubmission<object>(code);
+                //var submission = session.CompileSubmission<object>(code);
+                var submission = CompileSubmission(code, session);
 
                 using (var exeStream = new MemoryStream())
                 using (var pdbStream = new MemoryStream())
                 {
-                    var result = submission.Compilation.Emit(exeStream, pdbStream: pdbStream);
+                    var result = submission.Emit(exeStream, pdbStream: pdbStream);
 
                     if (result.Success)
                     {
@@ -71,7 +72,7 @@ namespace ScriptCs.Engine.Roslyn
             }
         }
 
-        private ScriptResult InvokeEntryPointMethod(Session session, Assembly assembly)
+        private ScriptResult InvokeEntryPointMethod(SessionState<string[]> session, Assembly assembly)
         {
             Logger.Debug("Retrieving compiled script class (reflection).");
 

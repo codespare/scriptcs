@@ -18,6 +18,10 @@
     <StyleCopEnabled>false</StyleCopEnabled>
   </PropertyGroup>
 
+  <PropertyGroup Condition=" ! $(AssemblyName.Contains(&quot;Tests&quot;)) ">
+    <LangVersion>6</LangVersion>
+  </PropertyGroup>
+
   <PropertyGroup Condition=" '$(Platform)' == 'AnyCPU' ">
     <Prefer32Bit>false</Prefer32Bit>
   </PropertyGroup>
